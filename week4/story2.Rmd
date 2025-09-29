@@ -1,0 +1,231 @@
+---
+title: "Story 2 — Trifecta Indicators"
+author: "Cai Lin"
+date: "`r format(Sys.Date())`"
+output: pdf_document
+---
+
+# =========================================================
+# Assignment: Investigating the Trifecta of Economic Indicators
+# Base R only: fetch from FRED API, prep monthly data, ONE plot, write PDF
+# Output: trifecta_econ_indicators.pdf in your working directory
+# =========================================================
+
+```{r }
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+
+# -------------- API KEY ---------------
+FRED_API_KEY <- Sys.getenv("FRED_API_KEY_ENV")
+# --------------------------------------
+
+start_date <- "2000-01-01"
+end_date   <- format(Sys.Date(), "%Y-%m-%d")
+
+# ---- Helper: fredgraph monthly CSV (no API key) ----
+fredgraph_monthly <- function(series_id, start_date="2000-01-01", end_date=format(Sys.Date(), "%Y-%m-%d"),
+                              aggregation = c("avg","eop")) {
+  aggregation <- match.arg(aggregation)
+  url <- paste0(
+    "https://fred.stlouisfed.org/graph/fredgraph.csv",
+    "?id=", series_id,
+    "&cosd=", start_date,
+    "&coed=", end_date,
+    "&frequency=m",
+    "&aggregation_method=", aggregation
+  )
+  dest <- tempfile(fileext = ".csv")
+  old <- getOption("download.file.method"); on.exit(options(download.file.method = old), add = TRUE)
+  options(download.file.method = "wininet")
+  try(utils::download.file(url, destfile = dest, mode = "wb", quiet = TRUE), silent = TRUE)
+  if (!file.exists(dest) || is.na(file.info(dest)$size) || file.info(dest)$size < 20) {
+    options(download.file.method = "libcurl")
+    utils::download.file(url, destfile = dest, mode = "wb", quiet = TRUE)
+  }
+  z <- utils::read.csv(dest, stringsAsFactors = FALSE)
+  names(z)[1:2] <- c("DATE","VALUE")
+  z$DATE <- as.Date(z$DATE)
+  suppressWarnings(z$VALUE <- as.numeric(z$VALUE))
+  z <- z[!is.na(z$VALUE), c("DATE","VALUE")]
+  data.frame(
+    ym         = format(z$DATE, "%Y-%m"),
+    month_date = as.Date(paste0(format(z$DATE, "%Y-%m"), "-01")),
+    value      = z$VALUE
+  )
+}
+
+# ---- Helper: FRED API (download → auto-decompress → read CSV) ----
+fred_api_csv <- function(series_id, api_key, start_date, end_date) {
+  base <- "https://api.stlouisfed.org/fred/series/observations"
+  url  <- paste0(
+    base,
+    "?series_id=", series_id,
+    "&api_key=", api_key,
+    "&file_type=csv",
+    "&observation_start=", start_date,
+    "&observation_end=", end_date
+  )
+
+  dest <- tempfile(fileext = ".csv")
+  old <- getOption("download.file.method"); on.exit(options(download.file.method = old), add = TRUE)
+  options(download.file.method = "wininet")
+  try(utils::download.file(url, destfile = dest, mode = "wb", quiet = TRUE), silent = TRUE)
+  if (!file.exists(dest) || is.na(file.info(dest)$size) || file.info(dest)$size < 20) {
+    options(download.file.method = "libcurl")
+    utils::download.file(url, destfile = dest, mode = "wb", quiet = TRUE)
+  }
+
+  # Read raw; detect gzip (1F 8B) or zlib/deflate (78 9C / 78 DA)
+  sz  <- file.info(dest)$size
+  raw <- readBin(dest, what = "raw", n = sz)
+  decomp <- NULL
+  if (length(raw) >= 2 && raw[1] == as.raw(0x1F) && raw[2] == as.raw(0x8B)) {
+    decomp <- memDecompress(raw, type = "gzip")
+  } else if (length(raw) >= 2 && raw[1] == as.raw(0x78) && (raw[2] == as.raw(0x9C) || raw[2] == as.raw(0xDA))) {
+    decomp <- memDecompress(raw, type = "zlib")
+  }
+
+  if (!is.null(decomp)) {
+    txt <- rawToChar(decomp); Encoding(txt) <- "UTF-8"
+    x <- utils::read.csv(textConnection(txt), stringsAsFactors = FALSE)
+  } else {
+    x <- try(utils::read.csv(dest, stringsAsFactors = FALSE), silent = TRUE)
+    if (inherits(x, "try-error")) x <- data.frame()
+  }
+
+  # If weird columns, try streaming via gzcon(url())
+  if (!all(c("date","value") %in% names(x))) {
+    con <- NULL
+    x2 <- try({
+      con <- gzcon(url(url, open = "rb"))
+      on.exit(try(close(con), silent = TRUE), add = TRUE)
+      txt <- readLines(con, warn = FALSE)
+      utils::read.csv(textConnection(txt), stringsAsFactors = FALSE)
+    }, silent = TRUE)
+    if (!inherits(x2, "try-error") && all(c("date","value") %in% names(x2))) x <- x2
+  }
+
+  # Final fallback (still base R): use monthly fredgraph for this series
+  if (!all(c("date","value") %in% names(x))) {
+    mg <- fredgraph_monthly(series_id, start_date, end_date, aggregation = "avg")
+    x <- data.frame(date = mg$month_date, value = mg$value, stringsAsFactors = FALSE)
+  }
+
+  x$date <- as.Date(x$date)
+  suppressWarnings(x$value <- as.numeric(x$value))
+  x <- x[!is.na(x$value), c("date","value")]
+  if (nrow(x) == 0) stop("No rows after parsing for ", series_id, ".")
+  x
+}
+
+# ---- Daily → Monthly mean ----
+toMonthlyMean <- function(df) {
+  ym <- format(df$date, "%Y-%m")
+  m  <- aggregate(df$value, by = list(ym = ym), FUN = function(v) mean(v, na.rm = TRUE))
+  names(m)[2] <- "value"
+  m$month_date <- as.Date(paste0(m$ym, "-01"))
+  m[order(m$month_date), ]
+}
+
+indexer <- function(x) 100 * x / x[1]
+
+
+
+# Quick ping to confirm the key + parser work
+head(fred_api_csv("FEDFUNDS", FRED_API_KEY, "2020-01-01", "2020-01-31"))
+```
+
+```{r setup}
+# Series IDs
+sid_djia     <- "DJIA"      # monthly via fredgraph
+sid_dgs10    <- "DGS10"     # daily via API
+sid_fedfunds <- "FEDFUNDS"  # daily via API
+
+# Fetch
+djia_m      <- fredgraph_monthly(sid_djia, start_date, end_date, aggregation = "avg")
+dgs10_daily <- fred_api_csv(sid_dgs10,    FRED_API_KEY, start_date, end_date)
+ff_daily    <- fred_api_csv(sid_fedfunds, FRED_API_KEY, start_date, end_date)
+
+# Daily → monthly
+dgs10_m    <- toMonthlyMean(dgs10_daily)
+fedfunds_m <- toMonthlyMean(ff_daily)
+
+# Merge monthly on 'ym'
+m1 <- merge(djia_m[, c("ym","month_date","value")],
+            dgs10_m[, c("ym","value")], by = "ym", suffixes = c("_djia","_dgs10"))
+m  <- merge(m1, fedfunds_m[, c("ym","value")], by = "ym")
+names(m)[names(m) == "value_djia"]  <- "djia"
+names(m)[names(m) == "value_dgs10"] <- "dgs10"
+names(m)[names(m) == "value"]       <- "fedfunds"
+
+m <- m[complete.cases(m$djia, m$dgs10, m$fedfunds), ]
+m <- m[order(m$month_date), ]
+
+# Index to 100 (first common month)
+djia_idx     <- indexer(m$djia)
+dgs10_idx    <- indexer(m$dgs10)
+fedfunds_idx <- indexer(m$fedfunds)
+
+```
+
+```{r figure 1}
+# m must have columns: month_date, djia, dgs10, fedfunds (aligned monthly, last ~10y)
+
+z <- function(x) (x - mean(x, na.rm=TRUE)) / sd(x, na.rm=TRUE)
+m$djia_z     <- z(m$djia)
+m$dgs10_z    <- z(m$dgs10)
+m$fedfunds_z <- z(m$fedfunds)
+
+yr <- range(c(m$djia_z, m$dgs10_z, m$fedfunds_z), na.rm = TRUE)
+yt <- pretty(yr)
+
+par(mar = c(4.2, 5, 4.2, 1), xaxs = "i", yaxs = "i")
+plot(m$month_date, m$djia_z, type = "n",
+     xlab = "Date", ylab = "Std. deviations from own mean",
+     main = "Rates, Yields, and DJIA — Standardized (Monthly, Last 10 Years)",
+     ylim = range(yt), xaxt = "n")
+abline(h = yt, col = "gray90", lty = "dotted")
+vpos <- m$month_date[seq(1, nrow(m), by = max(1L, floor(nrow(m)/10)))]
+abline(v = vpos, col = "gray95", lty = "dotted")
+lines(m$month_date, m$djia_z,     lwd = 2, col = "black", lty = 1)
+lines(m$month_date, m$dgs10_z,    lwd = 2, col = "red",   lty = 2)
+lines(m$month_date, m$fedfunds_z, lwd = 2, col = "blue",  lty = 3)
+axis.Date(1, at = vpos, format = "%Y")
+legend("topleft", bty = "n",
+       legend = c("DJIA (z-score)", "10Y Treasury (z-score)", "Fed Funds (z-score)"),
+       lwd = 2, col = c("black","red","blue"), lty = c(1,2,3))
+box()
+
+
+```
+
+```{r figure2}
+# keep overlapping, finite points
+ok <- is.finite(dgs10_idx) & is.finite(djia_idx)
+x  <- dgs10_idx[ok]
+y  <- djia_idx[ok]
+
+# axes
+xl <- pretty(range(x)); yl <- pretty(range(y))
+
+plot(x, y, pch = 20, cex = 0.6, col = grDevices::adjustcolor("black", 0.55),
+     xlab = "10Y Treasury Yield — Indexed (100 = first month)",
+     ylab = "DJIA — Indexed (100 = first month)",
+     main = "Cross-Plot: DJIA vs 10Y Yield (Monthly, Indexed)",
+     xaxs = "i", yaxs = "i", xlim = range(xl), ylim = range(yl))
+abline(h = yl, v = xl, col = "gray95", lty = "dotted")
+
+# smooth and linear fit
+lines(lowess(x, y, f = 2/3), lwd = 2)
+fit <- lm(y ~ x)
+abline(fit, lwd = 2, lty = 2, col = "gray40")
+
+# correlation + slope label
+r <- cor(x, y)
+lbl <- sprintf("Pearson r = %.2f | OLS slope = %.2f", r, coef(fit)[2])
+legend("topleft", bty = "n", text.col = "black", legend = lbl)
+
+
+```
+### Interpretation 
+
+Over roughly 25 years, the indicators generally move in related cycles. Periods of rising policy rates tend to align with higher 10-year yields, and equity performance often slows or becomes choppier during tightening phases; conversely, easing cycles and falling long yields frequently precede or accompany rebounds in equities. The cross-plot shows a modest positive association between long rates and equity levels across the sample, though the relationship is not one-for-one and depends on growth and inflation expectations. Overall, monetary policy and the term structure provide useful context for interpreting market pricing, but other fundamentals also shape equity outcomes.
